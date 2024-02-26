@@ -420,6 +420,15 @@ make clean
 WHISPER_CUBLAS=1 make -j
 ```
 
+Or if you want to compile all with cmake:
+
+```
+cmake -B build -DWHISPER_CUBLAS=ON -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_SDL2=ON
+cmake --build build -j --config Release
+```
+
+
+
 ## OpenCL GPU support via CLBlast
 
 For cards and integrated GPUs that support OpenCL, the Encoder processing can be largely offloaded to the GPU through CLBlast. This is especially useful for users with AMD APUs or low end devices for up to ~2x speedup.
