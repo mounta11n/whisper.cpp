@@ -17,6 +17,12 @@
 #include <thread>
 #include <vector>
 
+// Conversation state machine
+enum ConversationState {
+    WAITING_FOR_WAKE,      // Wartet auf Wake-Word
+    ACTIVE_CONVERSATION    // Aktiver Dialog, kein Wake-Word nötig
+};
+
 static std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::string & text, bool add_bos) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -69,6 +75,8 @@ struct whisper_params {
 
     float vad_thold  = 0.6f;
     float freq_thold = 100.0f;
+
+    int32_t conv_timeout_ms = 10000;  // Conversation timeout in milliseconds
 
     bool translate      = false;
     bool print_special  = false;
@@ -128,6 +136,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "--session")                         { params.path_session   = argv[++i]; }
         else if (arg == "-w"   || arg == "--wake-command")   { params.wake_cmd       = argv[++i]; }
         else if (arg == "-ho"  || arg == "--heard-ok")       { params.heard_ok       = argv[++i]; }
+        else if (arg == "-ct"  || arg == "--conv-timeout")   { params.conv_timeout_ms = std::stoi(argv[++i]); }
         else if (arg == "-l"   || arg == "--language")       { params.language       = argv[++i]; }
         else if (arg == "-mw"  || arg == "--model-whisper")  { params.model_wsp      = argv[++i]; }
         else if (arg == "-ml"  || arg == "--model-llama")    { params.model_llama    = argv[++i]; }
@@ -182,6 +191,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -bn NAME, --bot-name NAME  [%-7s] bot name (to display)\n",                       params.bot_name.c_str());
     fprintf(stderr, "  -w TEXT,  --wake-command T [%-7s] wake-up command to listen for\n",               params.wake_cmd.c_str());
     fprintf(stderr, "  -ho TEXT, --heard-ok TEXT  [%-7s] said by TTS before generating reply\n",         params.heard_ok.c_str());
+    fprintf(stderr, "  -ct N,    --conv-timeout N [%-7d] conversation timeout in ms (0 = disabled)\n",   params.conv_timeout_ms);
     fprintf(stderr, "  -l LANG,  --language LANG  [%-7s] spoken language\n",                             params.language.c_str());
     fprintf(stderr, "  -mw FILE, --model-whisper  [%-7s] whisper model file\n",                          params.model_wsp.c_str());
     fprintf(stderr, "  -ml FILE, --model-llama    [%-7s] llama model file\n",                            params.model_llama.c_str());
@@ -545,6 +555,15 @@ int main(int argc, char ** argv) {
     printf("%s%s", params.person.c_str(), chat_symb.c_str());
     fflush(stdout);
 
+    // conversation mode state machine
+    ConversationState conv_state = WAITING_FOR_WAKE;
+    auto last_interaction_time = std::chrono::steady_clock::now();
+
+    // show conversation mode info if wake command is enabled
+    if (use_wake_cmd && params.conv_timeout_ms > 0) {
+        printf("%s : conversation mode enabled - timeout: %d ms\n", __func__, params.conv_timeout_ms);
+    }
+
     // clear audio buffer
     audio.clear();
 
@@ -575,6 +594,19 @@ int main(int argc, char ** argv) {
 
         // delay
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // check for conversation timeout
+        if (conv_state == ACTIVE_CONVERSATION && params.conv_timeout_ms > 0) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_interaction_time).count();
+            
+            if (elapsed > params.conv_timeout_ms) {
+                conv_state = WAITING_FOR_WAKE;
+                printf("\n%s : conversation timeout - waiting for wake command\n", __func__);
+                printf("%s%s", params.person.c_str(), chat_symb.c_str());
+                fflush(stdout);
+            }
+        }
 
         int64_t t_ms = 0;
 
@@ -607,11 +639,22 @@ int main(int argc, char ** argv) {
 
                 // check if audio starts with the wake-up command if enabled
                 if (use_wake_cmd) {
-                    const float sim = similarity(wake_cmd_heard, wake_cmd);
+                    if (conv_state == WAITING_FOR_WAKE) {
+                        // In waiting state: require wake command
+                        const float sim = similarity(wake_cmd_heard, wake_cmd);
 
-                    if ((sim < 0.7f) || (text_heard.empty())) {
-                        audio.clear();
-                        continue;
+                        if ((sim < 0.7f) || (text_heard.empty())) {
+                            audio.clear();
+                            continue;
+                        }
+                        
+                        // Wake command recognized - switch to active conversation
+                        conv_state = ACTIVE_CONVERSATION;
+                        last_interaction_time = std::chrono::steady_clock::now();
+                        printf("\n%s : wake command recognized - entering conversation mode\n", __func__);
+                    } else {
+                        // In active conversation: use all heard text (no wake command needed)
+                        text_heard = all_heard;
                     }
                 }
 
@@ -789,6 +832,9 @@ int main(int argc, char ** argv) {
                 }
 
                 speak_with_file(params.speak, text_to_speak, params.speak_file, voice_id);
+
+                // Update interaction timer for conversation mode
+                last_interaction_time = std::chrono::steady_clock::now();
 
                 audio.clear();
             }
